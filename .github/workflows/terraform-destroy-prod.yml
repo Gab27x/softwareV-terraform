@@ -1,0 +1,165 @@
+name: Terraform Destroy - Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy-production" to confirm destruction of production infrastructure.'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_VERSION: '1.11.2'
+  AWS_REGION: 'us-east-1'
+  ENVIRONMENT: 'prod'
+  PROJECT_NAME: ecommerce
+
+jobs:
+  destroy:
+    name: Destroy Production Infrastructure
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.event.inputs.confirm == 'destroy-production'
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-TerraformDestroyProd
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      ############################################################
+      # FIX 1 → Conectar a EKS antes de destruir
+      ############################################################
+      - name: Configure kubectl
+        continue-on-error: true
+        run: |
+          CLUSTER_NAME="${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}"
+          aws eks update-kubeconfig \
+            --name $CLUSTER_NAME \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Test kubectl access
+        continue-on-error: true
+        run: kubectl get ns
+
+      - name: Delete Kubernetes Ingresses
+        continue-on-error: true
+        run: |
+          kubectl delete ingress microservices-ingress -n microservices || true
+          kubectl delete ingress sonatype-ingress -n artifact || true
+
+      ############################################################
+      # NEW: Esperar a que los ALBs y SGs sean eliminados
+      ############################################################
+      - name: Wait for ALB and SG cleanup
+        continue-on-error: true
+        run: |
+          for i in {1..30}; do
+            ALBS=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[?starts_with(DNSName, `k8s-`)].LoadBalancerArn' --output text)
+            if [ -z "$ALBS" ]; then
+              echo "No ALBs k8s-* encontrados."
+              break
+            fi
+            echo "Esperando que se eliminen los ALBs: $ALBS"
+            sleep 20
+          done
+
+          for i in {1..30}; do
+            SGS=$(aws ec2 describe-security-groups --query 'SecurityGroups[?starts_with(GroupName, `k8s-`) || starts_with(GroupName, `ecommerce-prod-alb-sg`) || starts_with(GroupName, `eks-cluster-sg-ecommerce-prod`)].GroupId' --output text)
+            if [ -z "$SGS" ]; then
+              echo "No SGs k8s-* ni ecommerce-prod-alb-sg ni eks-cluster-sg-ecommerce-prod encontrados."
+              break
+            fi
+            echo "Esperando que se eliminen los SGs: $SGS"
+            sleep 20
+          done
+
+      ############################################################
+      # FIX 2 → Borrar PODs, PVCs y eliminar namespaces problemáticos
+      ############################################################
+      - name: Cleanup PVCs, Pods and Namespaces
+        continue-on-error: true
+        run: |
+          echo "Deleting all pods and namespaces in logging and monitoring..."
+
+          for ns in logging monitoring; do
+            echo "Processing namespace $ns"
+
+            PODS=$(kubectl get pods -n $ns --no-headers 2>/dev/null | awk '{print $1}')
+            if [ ! -z "$PODS" ]; then
+              for pod in $PODS; do
+                kubectl delete pod $pod -n $ns --force --grace-period=0 || true
+              done
+            fi
+
+            kubectl delete ns $ns --force --grace-period=0 || true
+          done
+
+      ############################################################
+      # FIX 3 → Esperar a que desaparezcan PODs, PVCs y namespaces
+      ############################################################
+      - name: Wait for cleanup
+        continue-on-error: true
+        run: |
+          for ns in logging monitoring; do
+            for tipo in pods pvc; do
+              for i in {1..30}; do
+                CNT=$(kubectl get $tipo -n $ns --no-headers 2>/dev/null | wc -l)
+                if [ "$CNT" -eq 0 ]; then break; fi
+                sleep 10
+              done
+            done
+          done
+
+          # Esperar namespaces
+          for i in {1..30}; do
+            NSCNT=$(kubectl get ns logging monitoring --no-headers 2>/dev/null | wc -l)
+            if [ "$NSCNT" -eq 0 ]; then break; fi
+            sleep 10
+          done
+
+      ############################################################
+      # FIX 4 → ELIMINAR TODAS LAS ENIs CREADAS POR EKS
+      ############################################################
+      - name: Force delete leftover ENIs
+        continue-on-error: true
+        run: |
+          CLUSTER_TAG="kubernetes.io/cluster/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}"
+
+          ENI_IDS=$(aws ec2 describe-network-interfaces \
+            --filters Name=tag-key,Values=$CLUSTER_TAG \
+            --query 'NetworkInterfaces[*].NetworkInterfaceId' \
+            --output text)
+
+          if [ -z "$ENI_IDS" ]; then
+            echo "No leftover ENIs."
+          else
+            echo "Deleting ENIs: $ENI_IDS"
+            for eni in $ENI_IDS; do
+              aws ec2 delete-network-interface \
+                --network-interface-id $eni \
+                --region ${{ env.AWS_REGION }} || true
+            done
+          fi
+
+      ############################################################
+      # FIX 5 → Ejecutar el destroy LIMPIO
+      ############################################################
+      - name: Terraform Destroy
+        run: terraform destroy -input=false -auto-approve -var-file="tfvars/${{ env.ENVIRONMENT }}-${{ env.AWS_REGION }}.tfvars"
